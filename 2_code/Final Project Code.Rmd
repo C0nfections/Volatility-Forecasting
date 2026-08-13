@@ -1,0 +1,693 @@
+---
+title: "Final Project Code"
+author: "Leo Zhou"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+
+set.seed(1800)
+
+# clear environment
+rm(list = ls())
+```
+
+# Project overview
+
+This project asks:
+
+> **Can regression and machine learning models improve short-term volatility forecasts compared to a simple persistence baseline?**
+
+The goal is not to predict whether the stock market goes up or down. Instead, the goal is to predict whether the market will be calm or turbulent over the next few trading days. This is useful because volatility is closely connected to risk management, portfolio decisions, and investor uncertainty.
+
+A natural baseline is to assume that future volatility will look like recent volatility. This makes sense because volatility is persistent: calm periods often follow calm periods, and turbulent periods often follow turbulent periods. However, financial markets also contain forward-looking information. The VIX, for example, is often interpreted as a market-based measure of expected volatility. This project therefore asks whether models that use variables like the VIX and interest rates can improve on a simple recent-volatility benchmark.
+
+An extension to this asks a more specific question:
+
+> **Do the machine learning models still perform well if the VIX is removed as a predictor?**
+
+This matters because including VIX can make the model look stronger, but VIX is already a volatility-related measure. Removing it lets me test whether random forests and neural networks are learning useful patterns from past returns, realized volatility, and interest-rate variables, or whether their performance mainly depends on the VIX.
+
+# Load packages
+
+```{r, packages}
+# Install these packages once if they are not already installed:
+# install.packages(c("tidyverse", "randomForest", "nnet", "knitr"))
+# install.packages("gt")
+
+library(tidyverse)
+library(randomForest)
+library(nnet)
+library(knitr)
+library(gt)
+
+```
+
+# Read local CSV data
+
+The data is already available as local CSV files. This section only reads the local files and assigns clear variable names. Each dataset has a date column called `observation_date` and one value column.
+
+```{r, read data}
+sp500 <- read.csv("../1_data/SP500.csv", na.strings = c(".", "", "NA"))
+vix <- read.csv("../1_data/VIXCLS.csv", na.strings = c(".", "", "NA"))
+dgs10 <- read.csv("../1_data/DGS10.csv", na.strings = c(".", "", "NA"))
+fed_funds <- read.csv("../1_data/DFF.csv", na.strings = c(".", "", "NA"))
+
+names(sp500) <- c("observation_date", "SP500")
+names(vix) <- c("observation_date", "VIXCLS")
+names(dgs10) <- c("observation_date", "DGS10")
+names(fed_funds) <- c("observation_date", "DFF")
+
+sp500$observation_date <- as.Date(sp500$observation_date)
+vix$observation_date <- as.Date(vix$observation_date)
+dgs10$observation_date <- as.Date(dgs10$observation_date)
+fed_funds$observation_date <- as.Date(fed_funds$observation_date)
+
+sp500$SP500 <- as.numeric(sp500$SP500)
+vix$VIXCLS <- as.numeric(vix$VIXCLS)
+dgs10$DGS10 <- as.numeric(dgs10$DGS10)
+fed_funds$DFF <- as.numeric(fed_funds$DFF)
+
+head(sp500)
+head(vix)
+head(dgs10)
+head(fed_funds)
+```
+
+# Merge data
+
+Each row in the merged dataset represents one S&P 500 trading day. I use the S&P 500 dataset as the master dataset and merge the other variables by date.
+
+```{r, merge data}
+market <- merge(sp500, vix, by = "observation_date", all.x = TRUE)
+market <- merge(market, dgs10, by = "observation_date", all.x = TRUE)
+market <- merge(market, fed_funds, by = "observation_date", all.x = TRUE)
+
+market <- market %>% arrange(observation_date)
+
+head(market)
+summary(market)
+```
+
+# Data cleaning and feature engineering
+
+## Create helper functions
+
+The first helper function computes rolling volatility using the previous `window` days. The second helper function computes actual future volatility over the next `horizon` days. This future volatility variable is the outcome I am trying to predict.
+
+```{r helper-functions}
+# computes past volatility
+rolling_sd <- function(x, window) {
+  out <- rep(NA_real_, length(x))
+  for(i in seq_along(x)){
+    if(i >= window){
+      vals <- x[(i - window + 1):i]
+      if(sum(!is.na(vals)) == window){
+        out[i] <- sd(vals)
+      }
+    }
+  }
+  return(out)
+}
+
+# computes future volatility, which is the prediction target
+future_sd <- function(x, horizon) {
+  out <- rep(NA_real_, length(x))
+  n <- length(x)
+  for(i in seq_len(n)){
+    if(i + horizon <= n){
+      vals <- x[(i + 1):(i + horizon)]
+      if(sum(!is.na(vals)) == horizon){
+        out[i] <- sd(vals)
+      }
+    }
+  }
+  return(out)
+}
+```
+
+## Create returns, volatility, lags, and target variable
+
+The main outcome is `target_vol_5`, which is the realized volatility over the next 5 trading days. I annualize volatility by multiplying daily standard deviation by `sqrt(252)`, because there are roughly 252 trading days in a year.
+
+```{r, feature engineering}
+market <- market %>%
+  mutate(
+    sp500_return = log(SP500 / lag(SP500)),
+    abs_return = abs(sp500_return),
+    vol_5 = rolling_sd(sp500_return, 5) * sqrt(252),
+    vol_20 = rolling_sd(sp500_return, 20) * sqrt(252),
+    target_vol_5 = future_sd(sp500_return, 5) * sqrt(252),
+    abs_return_lag1 = lag(abs_return, 1),
+    abs_return_lag2 = lag(abs_return, 2),
+    vix_lag1 = lag(VIXCLS, 1),
+    vol_5_lag1 = lag(vol_5, 1),
+    vol_20_lag1 = lag(vol_20, 1))
+
+head(market)
+summary(market)
+```
+
+# Exploratory data analysis
+
+## Missing values
+
+```{r, missing values}
+colSums(is.na(market))
+```
+The missing values in this dataset are expected and are not necessarily a data quality problem. This project uses daily financial time-series data, and the different series do not all follow the exact same calendar. For example, the S&P 500, VIX, Treasury yields, and federal funds rate can have missing values on holidays, weekends, or other non-trading days.
+
+Some missing values are also created by variable construction. Daily returns require the previous day’s price, so the first return is missing. Lagged variables require previous observations, so the first few rows cannot have lag values. Rolling volatility measures, such as 5-day and 20-day volatility, require a full window of past returns. Therefore, the first several observations cannot have rolling volatility values. The future volatility target also requires future returns, so the final few rows cannot have the target value.
+
+The larger number of missing values for `vol_20` is especially expected because a 20-day rolling volatility measure needs 20 valid return observations in a row. If there is a missing return inside that 20-day window, the rolling volatility value for that window is also missing. This means a small number of missing price observations can create a larger number of missing rolling-volatility observations.
+
+These missing values are acceptable because the models are not estimated using incomplete rows. Before running regressions or machine learning models, the project filters the data to complete observations for the variables used in the analysis. In other words, the missing values appear during the data construction stage, but they are removed before model estimation and prediction.
+
+
+## S&P 500 over time
+
+```{r, plot sp500}
+ggplot(market, aes(x = observation_date, y = SP500)) +
+  geom_line() +
+  labs(title = "S&P 500 Index Level Over Time",
+    x = "Date",y = "S&P 500") +
+  theme_minimal()
+```
+
+## Daily returns
+
+```{r, plot returns-time}
+ggplot(market, aes(x = observation_date, y = sp500_return)) +
+  geom_line(alpha = 0.6) +
+  labs(title = "Daily S&P 500 Log Returns",
+    subtitle = "Large positive and negative spikes indicate turbulent periods.",
+    x = "Date", y = "Daily log return") +
+  theme_minimal()
+```
+
+```{r, plot return-distribution}
+ggplot(market, aes(x = sp500_return)) +
+  geom_histogram(bins = 60, color = "white") +
+  labs(title = "Distribution of Daily S&P 500 Returns",
+    x = "Daily log return", y = "Number of trading days") +
+  theme_minimal()
+```
+
+## Current volatility and future volatility
+
+```{r, plot volatility}
+ggplot(market, aes(x = observation_date)) +
+  geom_line(aes(y = vol_5, color = "Current 5-day volatility"), alpha = 0.7) +
+  geom_line(aes(y = target_vol_5, color = "Future 5-day volatility"), alpha = 0.7) +
+  labs(title = "Current 5-Day Volatility and Future 5-Day Volatility",
+    subtitle = "The forecasting task is to predict future volatility using information available today.",
+    x = "Date", y = "Annualized volatility", color = "Series") +
+  scale_color_manual(values = c(
+    "Current 5-day volatility" = "steelblue", "Future 5-day volatility" = "firebrick")) +
+  theme_minimal()
+```
+
+## VIX versus future realized volatility
+
+```{r, plot vix-future-vol}
+ggplot(market, aes(x = VIXCLS, y = target_vol_5)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(title = "VIX and Future Realized Volatility",
+    x = "VIX", y = "Future 5-day annualized volatility") +
+  theme_minimal()
+```
+
+# Modeling setup
+
+The models use only information available at time `t` to predict volatility after time `t`. I split the data chronologically: the first 80% is training data and the last 20% is testing data. This avoids randomly mixing past and future observations.
+
+The first set of features includes VIX. The extension removes VIX and `vix_lag1` from the machine learning models to see whether the ML models are still useful without a direct volatility index.
+
+```{r, model data}
+features <- c(
+  "vol_5",
+  "vol_20",
+  "abs_return",
+  "abs_return_lag1",
+  "abs_return_lag2",
+  "VIXCLS",
+  "vix_lag1",
+  "DGS10",
+  "DFF"
+)
+
+features_no_vix <- c(
+  "vol_5",
+  "vol_20",
+  "abs_return",
+  "abs_return_lag1",
+  "abs_return_lag2",
+  "DGS10",
+  "DFF"
+)
+
+model_data <- market %>%
+  select(observation_date, target_vol_5, all_of(features)) %>%
+  drop_na()
+
+split_index <- floor(0.80 * nrow(model_data))
+
+train <- model_data[1:split_index, ]
+test <- model_data[(split_index + 1):nrow(model_data), ]
+
+nrow(train)
+nrow(test)
+range(train$observation_date)
+range(test$observation_date)
+```
+
+# Baseline model
+
+The baseline model is a persistence model:
+
+> Future volatility is predicted to equal current 5-day volatility.
+
+This baseline is simple but meaningful because volatility is persistent. If the market is turbulent now, it often remains turbulent in the near future.
+
+```{r, baseline model}
+test$pred_baseline <- test$vol_5
+```
+
+# Linear regression benchmark
+
+This is the econometric benchmark. It asks whether current volatility, VIX, Treasury rates, federal funds rates, and lagged absolute returns help predict future volatility.
+
+```{r, ols model}
+ols_formula <- as.formula(paste("target_vol_5 ~", paste(features, collapse = " + ")))
+
+ols_fit <- lm(ols_formula, data = train)
+summary(ols_fit)
+
+test$pred_ols <- predict(ols_fit, newdata = test)
+```
+
+## OLS coefficient plot
+
+```{r, ols coefplot}
+ols_coef <- as.data.frame(summary(ols_fit)$coefficients)
+ols_coef$term <- rownames(ols_coef)
+names(ols_coef)[1:4] <- c("estimate", "std_error", "t_value", "p_value")
+
+ols_coef <- ols_coef %>%
+  filter(term != "(Intercept)") %>%
+  mutate(lower = estimate - 1.96 * std_error, upper = estimate + 1.96 * std_error)
+
+ggplot(ols_coef, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "OLS Coefficient Estimates",
+    subtitle = "Intervals are approximate 95% confidence intervals.",
+    x = "Coefficient estimate", y = "Predictor") +
+  theme_minimal()
+```
+
+# Machine learning models with VIX
+
+These models use the full feature set, including `VIXCLS` and `vix_lag1`.
+
+## Random forest with VIX
+
+```{r, rf model}
+rf_fit <- randomForest::randomForest(
+  ols_formula,
+  data = train,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_fit)
+test$pred_rf <- predict(rf_fit, newdata = test)
+```
+
+## Random forest variable importance with VIX
+
+```{r, rf-importance}
+importance_df <- as.data.frame(randomForest::importance(rf_fit))
+importance_df$feature <- rownames(importance_df)
+
+ggplot(importance_df, aes(x = reorder(feature, IncNodePurity), y = IncNodePurity)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance, With VIX",
+    x = "Feature", y = "Increase in node purity") +
+  theme_minimal()
+```
+
+## Neural network with VIX
+
+The neural network is more sensitive to scale than OLS or random forest, so I standardize the predictors and the outcome before fitting the model. The predictions are then converted back to the original volatility scale.
+
+```{r, nn model}
+x_train <- train[, features]
+x_test <- test[, features]
+
+x_scaled <- scale(x_train)
+x_center <- attr(x_scaled, "scaled:center")
+x_scale <- attr(x_scaled, "scaled:scale")
+
+x_train_scaled <- as.data.frame(x_scaled)
+x_test_scaled <- as.data.frame(scale(x_test, center = x_center, scale = x_scale))
+
+y_center <- mean(train$target_vol_5)
+y_scale <- sd(train$target_vol_5)
+y_train_scaled <- (train$target_vol_5 - y_center) / y_scale
+
+nn_train <- cbind(target = y_train_scaled, x_train_scaled)
+
+nn_fit <- nnet::nnet(target ~ ., data = nn_train, size = 5, decay = 0.01, linout = TRUE, maxit = 500, trace = FALSE)
+
+pred_nn_scaled <- predict(nn_fit, newdata = x_test_scaled)
+test$pred_nn <- as.numeric(pred_nn_scaled) * y_scale + y_center
+
+nn_with_vix_metrics <- tibble(
+  model = "Neural network, with VIX",
+  rmse = sqrt(mean((test$target_vol_5 - test$pred_nn)^2, na.rm = TRUE)),
+  mae = mean(abs(test$target_vol_5 - test$pred_nn), na.rm = TRUE),
+  mean_prediction = mean(test$pred_nn, na.rm = TRUE),
+  mean_actual = mean(test$target_vol_5, na.rm = TRUE)
+)
+
+knitr::kable(nn_with_vix_metrics, digits = 4)
+```
+
+# Extension: machine learning models without VIX
+
+This extension uses the same training and testing rows as the models above, but removes `VIXCLS` and `vix_lag1` from the machine learning predictors. This makes the comparison cleaner because the only major change is whether the ML model gets access to the VIX variables.
+
+If the no-VIX models perform similarly to the VIX models, that suggests the machine learning models are extracting useful information from recent returns, realized volatility, and interest-rate variables. If performance worsens substantially, that suggests VIX is doing a large share of the predictive work.
+
+
+## OLS without VIX
+
+This model uses the same outcome and the same train/test split, but it removes both VIX variables from the predictors.
+
+```{r, ols-model-no-vix}
+ols_formula_no_vix <- as.formula(
+  paste("target_vol_5 ~", paste(features_no_vix, collapse = " + "))
+)
+
+ols_fit_no_vix <- lm(ols_formula_no_vix, data = train)
+summary(ols_fit_no_vix)
+
+test$pred_ols_no_vix <- predict(ols_fit_no_vix, newdata = test)
+
+ols_no_vix_metrics <- tibble(
+  model = "OLS regression, no VIX",
+  rmse = sqrt(mean((test$target_vol_5 - test$pred_ols_no_vix)^2, na.rm = TRUE)),
+  mae = mean(abs(test$target_vol_5 - test$pred_ols_no_vix), na.rm = TRUE),
+  mean_prediction = mean(test$pred_ols_no_vix, na.rm = TRUE),
+  mean_actual = mean(test$target_vol_5, na.rm = TRUE)
+)
+
+knitr::kable(ols_no_vix_metrics, digits = 4)
+```
+
+
+## Random forest without VIX
+
+```{r, rf no-vix}
+rf_formula_no_vix <- as.formula(
+  paste("target_vol_5 ~", paste(features_no_vix, collapse = " + "))
+)
+
+rf_fit_no_vix <- randomForest::randomForest(
+  rf_formula_no_vix,
+  data = train,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_fit_no_vix)
+test$pred_rf_no_vix <- predict(rf_fit_no_vix, newdata = test)
+```
+
+## Random forest variable importance without VIX
+
+```{r, rf no-vix-importance}
+importance_no_vix_df <- as.data.frame(randomForest::importance(rf_fit_no_vix))
+importance_no_vix_df$feature <- rownames(importance_no_vix_df)
+
+ggplot(importance_no_vix_df, aes(x = reorder(feature, IncNodePurity), y = IncNodePurity)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance, Without VIX",
+    x = "Feature", y = "Increase in node purity") +
+  theme_minimal()
+```
+
+## Neural network without VIX
+
+```{r, nn no-vix}
+x_train_no_vix <- train[, features_no_vix]
+x_test_no_vix <- test[, features_no_vix]
+
+x_no_vix_scaled <- scale(x_train_no_vix)
+x_no_vix_center <- attr(x_no_vix_scaled, "scaled:center")
+x_no_vix_scale <- attr(x_no_vix_scaled, "scaled:scale")
+
+x_train_no_vix_scaled <- as.data.frame(x_no_vix_scaled)
+x_test_no_vix_scaled <- as.data.frame(scale(
+  x_test_no_vix,
+  center = x_no_vix_center,
+  scale = x_no_vix_scale
+))
+
+nn_train_no_vix <- cbind(target = y_train_scaled, x_train_no_vix_scaled)
+
+nn_fit_no_vix <- nnet::nnet(target ~ ., data = nn_train_no_vix, size = 5, decay = 0.01, linout = TRUE, maxit = 500, trace = FALSE)
+
+pred_nn_no_vix_scaled <- predict(nn_fit_no_vix, newdata = x_test_no_vix_scaled)
+test$pred_nn_no_vix <- as.numeric(pred_nn_no_vix_scaled) * y_scale + y_center
+
+nn_no_vix_metrics <- tibble(
+  model = "Neural network, no VIX",
+  rmse = sqrt(mean((test$target_vol_5 - test$pred_nn_no_vix)^2, na.rm = TRUE)),
+  mae = mean(abs(test$target_vol_5 - test$pred_nn_no_vix), na.rm = TRUE),
+  mean_prediction = mean(test$pred_nn_no_vix, na.rm = TRUE),
+  mean_actual = mean(test$target_vol_5, na.rm = TRUE)
+)
+
+knitr::kable(nn_no_vix_metrics, digits = 4)
+```
+
+# Model evaluation
+
+The main question is whether regression or machine learning beats the baseline out of sample. I compare models using RMSE and MAE. Lower values mean better predictive performance.
+
+```{r, model metrics}
+rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2, na.rm = TRUE))
+}
+
+mae <- function(actual, predicted) {
+  mean(abs(actual - predicted), na.rm = TRUE)
+}
+
+metrics <- tibble(
+  model = c(
+    "Baseline: current volatility",
+    "OLS regression, with VIX",
+    "OLS regression, no VIX",
+    "Random forest, with VIX",
+    "Random forest, no VIX",
+    "Neural network, with VIX",
+    "Neural network, no VIX"
+  ),
+  rmse = c(
+    rmse(test$target_vol_5, test$pred_baseline),
+    rmse(test$target_vol_5, test$pred_ols),
+    rmse(test$target_vol_5, test$pred_ols_no_vix),
+    rmse(test$target_vol_5, test$pred_rf),
+    rmse(test$target_vol_5, test$pred_rf_no_vix),
+    rmse(test$target_vol_5, test$pred_nn),
+    rmse(test$target_vol_5, test$pred_nn_no_vix)
+  ),
+  mae = c(
+    mae(test$target_vol_5, test$pred_baseline),
+    mae(test$target_vol_5, test$pred_ols),
+    mae(test$target_vol_5, test$pred_ols_no_vix),
+    mae(test$target_vol_5, test$pred_rf),
+    mae(test$target_vol_5, test$pred_rf_no_vix),
+    mae(test$target_vol_5, test$pred_nn),
+    mae(test$target_vol_5, test$pred_nn_no_vix)
+  )
+) %>%
+  arrange(rmse)
+
+knitr::kable(metrics, digits = 4)
+
+# used LLMs to get code that saves the table result to a directory
+table_path <- "../3_output/tables"
+dir.create(table_path, recursive = TRUE, showWarnings = FALSE)
+metrics %>% gt() %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  gtsave(filename = file.path(table_path, "metrics.png"))
+```
+
+```{r, plot model-metrics}
+ggplot(metrics, aes(x = reorder(model, rmse), y = rmse)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Out-of-Sample Forecasting Error by Model",
+    subtitle = "Lower RMSE indicates better predictive performance.",
+    x = "Model", y = "Test RMSE") +
+  theme_minimal()
+```
+
+## Direct comparison of ML models with and without VIX
+
+This table focuses only on whether removing the VIX changes the performance of the machine learning models.
+
+```{r, ml vix-comparison}
+ml_vix_comparison <- tibble(
+  model = c("Random forest", "Neural network"),
+  rmse_vix = c(
+    rmse(test$target_vol_5, test$pred_rf),
+    rmse(test$target_vol_5, test$pred_nn)
+  ),
+  rmse_no_vix = c(
+    rmse(test$target_vol_5, test$pred_rf_no_vix),
+    rmse(test$target_vol_5, test$pred_nn_no_vix)
+  ),
+  rmse_delta = rmse_no_vix - rmse_vix,
+  mae_vix = c(
+    mae(test$target_vol_5, test$pred_rf),
+    mae(test$target_vol_5, test$pred_nn)
+  ),
+  mae_no_vix = c(
+    mae(test$target_vol_5, test$pred_rf_no_vix),
+    mae(test$target_vol_5, test$pred_nn_no_vix)
+  ),
+  mae_delta = mae_no_vix - mae_vix
+)
+
+knitr::kable(ml_vix_comparison, digits = 4)
+
+# used LLMs to get code that saves the table result to a directory
+table_path <- "../3_output/tables"
+dir.create(table_path, recursive = TRUE, showWarnings = FALSE)
+ml_vix_comparison %>% gt() %>%
+  fmt_number(columns = where(is.numeric), decimals = 4) %>%
+  gtsave(filename = file.path(table_path, "ml_vix_comparison.png"))
+```
+
+Positive values in the change columns mean that removing VIX made the model worse. Negative values mean that removing VIX improved the model.
+
+# Actual versus predicted volatility
+
+```{r, actual vs predicted line}
+pred_long <- test %>%
+  select(
+    observation_date,
+    actual = target_vol_5,
+    baseline = pred_baseline,
+    ols_with_vix = pred_ols,
+    ols_no_vix = pred_ols_no_vix,
+    random_forest_with_vix = pred_rf,
+    random_forest_no_vix = pred_rf_no_vix,
+    neural_network_with_vix = pred_nn,
+    neural_network_no_vix = pred_nn_no_vix
+  ) %>%
+  pivot_longer(
+    cols = -observation_date,
+    names_to = "series",
+    values_to = "volatility"
+  ) %>%
+  filter(!is.na(volatility))
+
+ggplot(pred_long, aes(x = observation_date, y = volatility, color = series)) +
+  geom_line(linewidth = 0.8, alpha = 0.9) +
+  scale_color_manual(
+    values = c(
+      "actual" = "black",
+      "baseline" = "gray50",
+      "ols_with_vix" = "blue",
+      "ols_no_vix" = "skyblue",
+      "random_forest_with_vix" = "red",
+      "random_forest_no_vix" = "orange",
+      "neural_network_with_vix" = "purple",
+      "neural_network_no_vix" = "darkgreen"
+    ),
+    labels = c(
+      "actual" = "Actual future volatility",
+      "baseline" = "Baseline",
+      "ols_with_vix" = "OLS with VIX",
+      "ols_no_vix" = "OLS no VIX",
+      "random_forest_with_vix" = "Random forest with VIX",
+      "random_forest_no_vix" = "Random forest no VIX",
+      "neural_network_with_vix" = "Neural network with VIX",
+      "neural_network_no_vix" = "Neural network no VIX"
+    )
+  ) +
+  labs(
+    title = "Actual and Predicted Future Volatility on the Test Set",
+    x = "Date", y = "Annualized future 5-day volatility",
+    color = "Series") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  )
+```
+
+```{r, actual vs predicted scatter}
+pred_scatter <- test %>%
+  select(
+    actual = target_vol_5,
+    baseline = pred_baseline,
+    ols_with_vix = pred_ols,
+    random_forest_with_vix = pred_rf,
+    random_forest_no_vix = pred_rf_no_vix,
+    neural_network_with_vix = pred_nn,
+    neural_network_no_vix = pred_nn_no_vix
+  ) %>%
+  pivot_longer(
+    cols = -actual,
+    names_to = "model",
+    values_to = "prediction"
+  ) %>%
+  filter(!is.na(prediction))
+
+ggplot(pred_scatter, aes(x = actual, y = prediction)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~model) +
+  labs(title = "Predicted Versus Actual Future Volatility",
+    subtitle = "Points closer to the dashed line indicate better predictions.",
+    x = "Actual future volatility", y = "Predicted future volatility") +
+  theme_minimal()
+```
+
+# Interpreting the results
+
+The baseline model represents the idea that future volatility should look like recent realized volatility. This is a reasonable benchmark because volatility tends to persist over time. However, the baseline is not the best-performing model. Both the OLS model with VIX and the random forest model with VIX have lower RMSE and MAE than the baseline, which suggests that additional predictors contain useful forecasting information.
+
+The strongest result is that the OLS regression with VIX performs best overall. It has the lowest RMSE and MAE, meaning its predictions are closest to actual future 5-day volatility in the test set. The random forest with VIX performs similarly but does not improve on the simpler OLS model.
+
+The no-VIX comparison is important because it tests whether the models are mainly relying on the volatility index. For both OLS and random forest, removing VIX makes performance worse. This suggests that VIX adds meaningful predictive information beyond recent realized volatility, returns, and interest-rate variables. In other words, the forward-looking information in VIX appears to help forecast future realized volatility.
+
+At the same time, the machine learning models do not automatically outperform the simpler econometric model. The neural network performs much worse than the other models, likely because the dataset is noisy, the sample is limited, or the model is not tuned enough. This shows that added complexity can hurt forecasting performance when the model overfits or fails to learn a stable relationship.
+
+Overall, the results suggest that VIX improves short-term volatility forecasts, but the best-performing model in this project is still a relatively simple OLS regression rather than a more complex machine learning model.
